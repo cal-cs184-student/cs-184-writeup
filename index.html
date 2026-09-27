@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Homework 1 — Rasterizer | Edward Song</title>
+<style>
+:root{color-scheme:light;font-family:Georgia,serif;color:#17212b;background:#fff;font-size:17px;line-height:1.65}
+body{margin:0}main{max-width:1040px;margin:auto;padding:52px 32px}h1,h2,h3,nav,.meta,figcaption,table{font-family:Arial,sans-serif}
+h1{font-size:2.5rem;line-height:1.15;margin:10px 0}h2{font-size:1.65rem;line-height:1.25;border-top:2px solid #168a9a;padding-top:22px;margin-top:54px}h3{font-size:1rem;margin-top:24px}p{margin:12px 0}a{color:#086d83}nav{display:flex;flex-wrap:wrap;gap:18px;margin-top:24px;font-size:.9rem}.meta{color:#536370;font-size:.86rem}.pending{background:#fff5d9;padding:8px 12px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.three{grid-template-columns:repeat(3,minmax(0,1fr))}figure{margin:16px 0;break-inside:avoid}img{display:block;width:100%;height:auto;border:1px solid #dce2e5;box-sizing:border-box}figcaption{font-size:.78rem;line-height:1.45;margin-top:7px;color:#374753}figure.single{max-width:760px;margin:20px auto}pre{padding:14px;background:#f2f5f6;overflow:auto;font-size:.82rem;line-height:1.5}code{font-size:.88em}table{border-collapse:collapse;width:100%;font-size:.78rem;line-height:1.5;margin:20px 0}th,td{text-align:left;padding:10px;border:1px solid #dce2e5;vertical-align:top}th{background:#edf4f5}li{margin:7px 0}section{scroll-margin-top:20px}
+@media(max-width:700px){main{padding:24px 16px}.grid,.three{grid-template-columns:1fr}h1{font-size:2rem}}
+@page{size:A4;margin:15mm}
+@media print{:root{font-size:10pt;line-height:1.4}main{padding:0;max-width:none}nav{display:none}h1{font-size:25pt}h2{font-size:18pt;margin-top:0;padding-top:8px}h3{break-after:avoid}section{break-before:page}section#overview{break-before:auto}figure,table,pre{break-inside:avoid}a{color:inherit;text-decoration:none}.grid{gap:9px}.three{gap:7px}.meta{font-size:8pt}figcaption{font-size:8pt}p{orphans:3;widows:3}.single{max-width:480px!important}}
+</style>
+</head>
+<body><main>
+<header>
+<p class="meta">CS 184/284A · Fall 2026</p>
+<h1>Homework 1: Rasterizer</h1>
+<p class="meta">Edward Song</p>
+<p class="meta pending" id="webpage-url">Public webpage URL: to be added after the separate write-up repository is published.</p>
+</header>
+<section id="overview">
+<h2>Overview</h2>
+<p>I implemented a software rasterizer that converts SVG geometry into pixels. The pipeline supports solid triangles, supersampling, hierarchical transforms, interpolated vertex colors, and texture mapping with nearest, bilinear, and mipmap filtering. These features build on the same sample-coverage tests: transformations place the geometry, barycentric coordinates interpolate its attributes, and sampling determines the colors stored in the framebuffer.</p>
+<p>The most useful connection is that a screen pixel represents an area. Testing only its center loses information about small features. Supersampling estimates geometric coverage with several samples, while mipmaps approximate a texture’s average over the area represented by a pixel. They solve related sampling problems at different stages of the pipeline.</p>
+<p>The main implementation issues were keeping the sample-buffer layout consistent across all primitives, handling floating-point edge tests consistently under reversed winding, and ensuring that every allocated mipmap level contained filtered data.</p>
+</section>
+<section id="task1">
+<h2>Task 1: Drawing Single-Color Triangles</h2>
+<h3>1. How I rasterize a triangle</h3>
+<p>I find the minimum and maximum vertex coordinates, round the bounds to pixel boundaries, and clip this bounding box to the framebuffer. At one sample per pixel, I test the center <code>(x + 0.5, y + 0.5)</code>. Each triangle edge defines a half-plane, so I evaluate three signed edge functions:</p>
+<pre>E(a, b, p) = (bx − ax)(py − ay) − (by − ay)(px − ax)</pre>
+<p>A sample is covered if all three values are nonnegative or all three are nonpositive. Allowing either sign supports both winding orders, and including zero fills samples on boundaries. I fill covered samples with the triangle’s color.</p>
+<h3>2. Bounding-box efficiency</h3>
+<p>The loops visit only the triangle’s pixel-aligned bounding box, clipped to the screen. Each sample takes constant work, so the cost at one sample per pixel is <strong>O(B)</strong>, where B is the number of pixels in that box. This matches the complexity of checking every sample inside the bounding box. No full-frame scan is needed.</p>
+<figure class="single"><img src="images/task2-1.png" alt="Solid triangles with the inspector showing a stair-stepped red triangle edge"><figcaption>basic/test4.svg, default view, 1 sample per pixel. The inspector is centered on the thin red triangle near its left tip.</figcaption></figure>
+</section>
+<section id="task2">
+<h2>Task 2: Antialiasing by Supersampling</h2>
+<h3>1. Algorithm, data structures, and pipeline changes</h3>
+<p>For sample rate R, I divide each pixel into an n × n grid, where n = √R. I test the center of each grid cell at <code>(x + (sx + 0.5)/n, y + (sy + 0.5)/n)</code>. The same three edge tests determine whether each subsample receives the triangle’s color.</p>
+<p>The one-dimensional <code>sample_buffer</code> contains <code>width × height × R</code> floating-point colors. Each pixel stores R consecutive samples, with index <code>(y × width + x) × R + sy × n + sx</code>. I resize and reset the buffer when either the framebuffer size or sample rate changes, and clear it before each redraw. Points and lines fill every sample of their pixels so their original appearance is preserved.</p>
+<p>After all primitives are drawn, <code>resolve_to_framebuffer()</code> averages the R colors for each pixel, clamps the RGB channels, and rounds them to 8-bit values. Keeping the subsamples separate until this final step preserves contributions from multiple primitives within the same pixel.</p>
+<p>Supersampling is useful because averaging estimates partial pixel coverage. A pixel with only some samples inside a triangle becomes a blend of the triangle and background colors. This box filtering before downsampling reduces stair-step boundaries and helps retain thin features that a single sample might miss.</p>
+<h3>2. Comparison at 1, 4, and 16 samples per pixel</h3>
+<div class="grid three">
+<figure><img src="images/task2-1.png" alt="Triangle scene at one sample"><figcaption>1 sample: an all-or-nothing coverage decision produces abrupt steps.</figcaption></figure>
+<figure><img src="images/task2-4.png" alt="Triangle scene at four samples"><figcaption>4 samples: a 2 × 2 grid captures partial coverage and creates intermediate pink edge pixels.</figcaption></figure>
+<figure><img src="images/task2-16.png" alt="Triangle scene at sixteen samples"><figcaption>16 samples: a 4 × 4 grid gives a more gradual transition and better continuity near thin tips.</figcaption></figure>
+</div>
+<p>All three images use the default view of <code>basic/test4.svg</code> and the same inspector location. The inspector shows why the higher rates look smoother: the edge changes through intermediate colors instead of jumping directly from white to red. A finite grid can still miss extremely thin features; supersampling reduces aliasing without eliminating it completely.</p>
+</section>
+<section id="task3">
+<h2>Task 3: Transforms</h2>
+<h3>My cubeman pose</h3>
+<p>I changed cubeman into a teal robot waving with its arm on the viewer’s right. I tilted the whole body slightly, raised the upper arm, and rotated the forearm at the elbow so the hand points upward. I also angled the legs and changed the head to gold. The nested arm groups demonstrate hierarchical transforms: changing the upper-arm orientation also carries the forearm along, while its elbow rotation provides an additional bend.</p>
+<figure class="single"><img src="images/task3-robot.png" alt="Teal cubeman with a gold head and a raised bent arm"><figcaption>Waving cubeman, rendered with 16 samples per pixel. Source: <a href="my_robot.svg">my_robot.svg</a>.</figcaption></figure>
+</section>
+<section id="task4">
+<h2>Task 4: Barycentric Coordinates</h2>
+<h3>1. Meaning and implementation</h3>
+<p>Barycentric coordinates describe a point as a weighted combination of a triangle’s three vertices: <code>p = αA + βB + γC</code>, with <code>α + β + γ = 1</code>. Inside the triangle, the weights are nonnegative. At vertex A the weights are (1, 0, 0), while at the centroid they are (⅓, ⅓, ⅓).</p>
+<p>I compute each weight by dividing the sample’s opposite-edge function by the triangle’s signed doubled area. Reversing the winding reverses both signs, preserving the weights. For every covered subsample, I interpolate the vertex colors using <code>C = αC₀ + βC₁ + γC₂</code> and store the result in the sample buffer.</p>
+<div class="grid">
+<figure><img src="images/task4-rgb.png" alt="Triangle smoothly interpolating red at the top green at the lower left and blue at the lower right"><figcaption>RGB triangle, 16 samples per pixel. Near each corner its corresponding weight dominates; the centroid mixes equal red, green, and blue into gray. Source: <a href="barycentric.svg">barycentric.svg</a>.</figcaption></figure>
+<figure><img src="images/task4-wheel.png" alt="Smooth color wheel with a black center"><figcaption>basic/test7.svg, default view, 1 sample per pixel. The dark center and colored outer vertices interpolate smoothly across the triangular sectors.</figcaption></figure>
+</div>
+<h3>2. What the images demonstrate</h3>
+<p>The RGB triangle shows that the weights vary continuously across the interior. Along the edge opposite the red vertex, its weight is zero, so only green and blue are mixed. The color wheel applies the same interpolation to many adjacent triangles. Its outer silhouette remains jagged at one sample per pixel even though the colors inside the triangles vary smoothly.</p>
+</section>
+<section id="task5">
+<h2>Task 5: Pixel Sampling for Texture Mapping</h2>
+<h3>1. Pixel sampling and implementation</h3>
+<p>Texture mapping assigns UV coordinates to triangle vertices. I interpolate these coordinates with the sample’s barycentric weights, then look up a color in the texture. Pixel sampling determines how to reconstruct a texture color when the UV coordinate falls between stored texels.</p>
+<p>I clamp UV coordinates to [0, 1] and map them to <code>x = u(W − 1)</code> and <code>y = v(H − 1)</code> in the selected mip level. Nearest sampling rounds these coordinates and returns one texel. Bilinear sampling reads the four surrounding texels, blends horizontally using the fractional x coordinate, then blends those two results vertically using the fractional y coordinate. Border neighbors are clamped to valid texel indices, including at 1 × 1 levels.</p>
+<p>For this comparison I keep level sampling at <code>L_ZERO</code>, so all texture lookups use the original image. Nearest and bilinear are selected independently from the number of screen samples per pixel.</p>
+<h3>2. Four-way comparison</h3>
+<div class="grid">
+<figure><img src="images/task5-0-1.png" alt="Nearest texture sampling with one screen sample"><figcaption>P_NEAREST, 1 sample per pixel.</figcaption></figure>
+<figure><img src="images/task5-1-1.png" alt="Bilinear texture sampling with one screen sample"><figcaption>P_LINEAR, 1 sample per pixel.</figcaption></figure>
+<figure><img src="images/task5-0-16.png" alt="Nearest texture sampling with sixteen screen samples"><figcaption>P_NEAREST, 16 samples per pixel.</figcaption></figure>
+<figure><img src="images/task5-1-16.png" alt="Bilinear texture sampling with sixteen screen samples"><figcaption>P_LINEAR, 16 samples per pixel.</figcaption></figure>
+</div>
+<p>These images use <code>texmap/test5.svg</code>, the same view at twice the default magnification, and the same inspector location over the gold-and-white detail. Nearest sampling at one sample gives abrupt changes between texels. Bilinear sampling introduces intermediate colors and makes the thin curved details smoother. Sixteen screen samples improve both methods by averaging several UV lookups within each pixel. With bilinear sampling and 16 samples, the inspected detail has the most gradual transitions, with some loss of sharpness.</p>
+<h3>3. When the methods differ most</h3>
+<p>The difference is particularly visible when a low-resolution texture is enlarged or distorted and neighboring texels have contrasting colors. Nearest sampling preserves blocks of constant color, whereas bilinear interpolation smooths the changes between texels. Supersampling can reduce the difference by averaging nearest lookups, but it does not make the two reconstruction methods identical. During strong minification, four neighboring texels are not enough to represent the whole pixel footprint; mipmaps address that problem in Task 6.</p>
+</section>
+<section id="task6">
+<h2>Task 6: Level Sampling with Mipmaps</h2>
+<h3>1. Level sampling and implementation</h3>
+<p>Level sampling chooses a texture resolution appropriate for a screen pixel’s footprint. A mipmap stores successively filtered, smaller versions of the original texture. When many original texels map to one screen pixel, a coarser level approximates their average without reading all of them individually.</p>
+<p>At each covered sample I interpolate UV coordinates at <code>(x, y)</code>, <code>(x + 1, y)</code>, and <code>(x, y + 1)</code>. I subtract the first UV from the other two, scale u differences by the base texture width and v differences by its height, and compute:</p>
+<pre>dx = ((uₓ − u)W, (vₓ − v)H)
+dy = ((uᵧ − u)W, (vᵧ − v)H)
+L  = max(length(dx), length(dy))
+D  = clamp(log₂(max(1, L)), 0, last mip level)</pre>
+<p>The offsets are a full screen pixel even when supersampling, as required by the task. <code>L_ZERO</code> always selects level 0. <code>L_NEAREST</code> rounds D to the closest level. <code>L_LINEAR</code> samples floor(D) and ceil(D) and blends by D’s fractional part. Each level uses the selected nearest or bilinear pixel filter; combining linear level sampling with bilinear pixel sampling gives trilinear filtering.</p>
+<p>I access mip levels by reference to avoid copying entire images. I also fixed the starter mip-generation loop so it fills every allocated level, including the smallest levels. Otherwise sufficiently large footprints could select allocated but unfiltered black images.</p>
+<h3>2. Speed, memory, and antialiasing tradeoffs</h3>
+<table>
+<thead><tr><th>Technique</th><th>Speed</th><th>Memory</th><th>Effect and limitation</th></tr></thead>
+<tbody>
+<tr><td>Nearest pixel sampling</td><td>1 texel fetch per level per sample</td><td>No additional texture images</td><td>Fast but blocky under magnification and prone to aliasing under minification</td></tr>
+<tr><td>Bilinear pixel sampling</td><td>4 texel fetches and interpolation</td><td>No additional texture images</td><td>Smoother magnification; does not integrate a large minification footprint</td></tr>
+<tr><td>Nearest mip level</td><td>Footprint calculation plus 1 selected level</td><td>Full mip chain; about ⅓ extra texture storage for square power-of-two textures</td><td>Reduces minification aliasing; discrete level changes can remain visible</td></tr>
+<tr><td>Linear mip levels</td><td>2 level lookups; up to 8 texel fetches with bilinear filtering</td><td>Same mip chain</td><td>Smooths transitions between resolutions; isotropic footprint estimates can blur stretched textures</td></tr>
+<tr><td>R screen samples per pixel</td><td>R coverage and shading evaluations per pixel</td><td>R colors per framebuffer pixel</td><td>Improves geometry edges and texture sampling; high rates cost more work and can still undersample fine patterns</td></tr>
+</tbody></table>
+<p>The ⅓ mip overhead follows from <code>1/4 + 1/16 + … = 1/3</code>; exact overhead varies with texture shape and dimensions. In this implementation the mip chain is allocated even when <code>L_ZERO</code> is selected, so changing the level mode does not itself allocate more memory. Likewise, nearest and bilinear share the same stored images.</p>
+<h3>3. Comparison using a separately sourced PNG</h3>
+<p>I used an 800 × 600 one-pixel black-and-white checkerboard by Johannes Kalliauer, available under CC0 from <a href="https://commons.wikimedia.org/wiki/File:1px-black-white-pattern_checkerboard.png">Wikimedia Commons</a>. Its high-frequency pattern makes aliasing easy to see. I copied the mesh from <code>texmap/test6.svg</code> and pointed it at this texture. The scene and texture are included as <a href="mipmap_demo.svg">mipmap_demo.svg</a> and <a href="checkerboard.png">checkerboard.png</a>.</p>
+<div class="grid">
+<figure><img src="images/task6-0-0.png" alt="Checkerboard with level zero nearest sampling showing moire rings"><figcaption>L_ZERO + P_NEAREST, 1 sample per pixel.</figcaption></figure>
+<figure><img src="images/task6-0-1.png" alt="Checkerboard with level zero bilinear sampling showing softened moire"><figcaption>L_ZERO + P_LINEAR, 1 sample per pixel.</figcaption></figure>
+<figure><img src="images/task6-1-0.png" alt="Checkerboard with nearest mip level and nearest texel sampling mostly gray"><figcaption>L_NEAREST + P_NEAREST, 1 sample per pixel.</figcaption></figure>
+<figure><img src="images/task6-1-1.png" alt="Checkerboard with nearest mip level and bilinear texel sampling mostly gray with smoother remaining detail"><figcaption>L_NEAREST + P_LINEAR, 1 sample per pixel.</figcaption></figure>
+</div>
+<p>All four images have the same view and inspector location. With level 0 and nearest sampling, the output contains strong false rings and wavy patterns. Bilinear sampling reduces their contrast but leaves substantial moiré because its small neighborhood does not cover the entire screen-pixel footprint.</p>
+<p>Nearest-level mipmapping replaces most of this unstable detail with gray, which is the expected average of equally sized black and white checks. The two smaller patterned regions correspond to parts of the mapping where a finer level is selected. Bilinear sampling softens the remaining texel changes there. This example also shows a limitation: choosing the nearest mip level can leave abrupt transitions and does not eliminate every aliasing artifact.</p>
+</section>
+</main></body></html>
